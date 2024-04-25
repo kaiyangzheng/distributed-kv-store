@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+
+from enum import Enum
+import random
+import argparse, socket, time, json, select, struct, sys, math, os
+
+BROADCAST = "FFFF"
+
+# Role for a replica in RAFT
+class Role(str, Enum):
+    FOLLOWER = "follower"
+    CANDIDATE = "candidate"
+    LEADER = "leader"
+    
+# RPC messages for RAFT
+class RPC(str, Enum):
+    REQUEST_VOTE = "request_vote"
+    REQUEST_VOTE_RESPONSE = "request_vote_response"
+    APPEND_ENTRIES = "append_entries"
+    APPEND_ENTRIES_RESPONSE =  "append_entries_response"
+    
+# RAFT replica representing a node 
+class Replica: 
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))  
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+        
+        # election state
+        self.current_term = 0
+        self.voted_for = None
+        self.current_role = Role.FOLLOWER
+        self.current_leader = None
+        self.votes_received = set()
+        
+        self.reset_election_timeout()
+        self.heartbeat_timeout = math.inf
+        
+        # message queue
+        self.messages = []
+        
+        # state machine
+        self.kvstore = {}
+        
+        # logs
+        self.logs = []
+        self.logs.append({
+            "term": 0,
+            "key": "0",
+            "value": "0",
+            "MID": 0,
+            "src": self.id,
+        })
+        self.commit_index = 0
+        self.last_applied = 0
+        
+        # next and match index for each follower
+        self.next_index = {}
+        self.match_index = {}
+        
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+        
+    # TIMEOUTS
+        
+    # reset election timeout to a random value in range
+    def reset_election_timeout(self):
+        self.election_timeout = time.time() + random.uniform(0.45, 0.60)
+        
+    # reset heartbeat timeout
+    def reset_heartbeat_timeout(self):
+        self.heartbeat_timeout = (time.time() + 0.4)
+        
+    # check if current user is not a leader and the election timeout has passed
+    def check_election_timeout(self):
+        return self.current_role != Role.LEADER and time.time() > self.election_timeout
+    
+    # check if current user is a leader and the heartbeat timeout has passed
+    def check_heartbeat_timeout(self):
+        return self.current_role == Role.LEADER and time.time() > self.heartbeat_timeout
+    
+    # ELECTION
+    
+    # start an election after timeout has passed
+    def start_election(self):
+        # increment term and change role to candidate
+        self.current_term += 1
+        self.current_role = Role.CANDIDATE
+        # vote for self
+        self.voted_for = self.id
+        self.votes_received = {self.id}
+        # request votes from other replicas
+        self.request_vote()
+        # reset election timeout
+        self.reset_election_timeout()
+        
+    # change state of node after winning an election
+    def win_election(self):
+        # change role to leader
+        self.current_role = Role.LEADER
+        self.current_leader = self.id
+        # reset election and heartbeat timeouts
+        self.reset_heartbeat_timeout()
+        self.reset_election_timeout()
+        # initialize next and match index for each follower and send heartbeat
+        for follower in self.others:
+            self.init_index(follower)
+            self.request_append_entries(follower, heartbeat=True)
+        
+    # convert node to follower
+    def convert_to_follower(self, msg):
+        # change role to follower and update term, leader, and reset election timeout
+        self.current_role = Role.FOLLOWER
+        self.current_term = msg["term"]
+        self.voted_for = None
+        self.current_leader = msg["src"]
+        self.reset_election_timeout()
+        
+    # RequestVote RPC
+    def request_vote(self):
+        request_vote_msg = {
+            "src": self.id,
+            "dst": BROADCAST,
+            "leader": BROADCAST, 
+            "type": RPC.REQUEST_VOTE,
+            "term": self.current_term,
+            "last_log_index": len(self.logs) - 1,
+            "last_log_term": self.logs[-1]["term"],
+        }
+        self.send(request_vote_msg)
+        
+    # receive RequestVote RPC
+    def receive_request_vote(self, msg):
+        log_ok = (len(self.logs) == 0 or msg["last_log_index"] >= len(self.logs) - 1) and (len(self.logs) == 0 or msg["last_log_term"] >= self.logs[-1]["term"])
+       
+        # check that the terms are same, the receiver has not voted for another candidate, and the logs are up-to-date
+        if msg["term"] == self.current_term and (self.voted_for is None or self.voted_for == msg["src"]) and log_ok:
+            # vote for the candidate and reset election timeout
+            self.voted_for = msg["src"]
+            vote_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": BROADCAST,
+                "type": RPC.REQUEST_VOTE_RESPONSE,
+                "term": self.current_term,
+                "vote": True,
+            }
+            self.send(vote_msg)
+            self.reset_election_timeout()
+        else:
+            # don't vote for the candidate
+            vote_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": BROADCAST,
+                "type": RPC.REQUEST_VOTE_RESPONSE,
+                "term": self.current_term,
+                "vote": False,
+            }
+            self.send(vote_msg)
+            
+    # receive response to RequestVote RPC
+    def receive_vote(self, msg):
+        # if the response is positive, add the vote to the set of votes received
+        if self.current_role == Role.CANDIDATE and msg["term"] == self.current_term and msg["vote"]:
+            self.votes_received.add(msg["src"])
+            # if quorum of votes received, win the election
+            if len(self.votes_received) >= math.ceil((len(self.others) + 1) / 2):
+                self.win_election()
+                            
+    # LOG REPLICATION
+    
+    # initialize next and match index for a follower (called after election is won)
+    def init_index(self, follower):
+        self.next_index[follower] = len(self.logs)
+        self.match_index[follower] = 0
+        
+    # AppendEntries RPC
+    def request_append_entries(self, follower, heartbeat=False):   
+        # get 50 entries from the log starting from the follower's next index
+        entries = self.logs[self.next_index[follower]:self.next_index[follower] + 50] if not heartbeat else []
+        # send the entries to the follower
+        append_entries_msg = {
+            "src": self.id,
+            "dst": follower,
+            "leader": self.current_leader,
+            "type": RPC.APPEND_ENTRIES,
+            "term": self.current_term,
+            "prev_log_index": self.next_index[follower] - 1,
+            "prev_log_term": self.logs[self.next_index[follower] - 1]["term"],
+            "entries": entries,
+            "leader_commit": self.commit_index,
+        }
+        self.send(append_entries_msg)
+        
+    # receive AppendEntries RPC
+    def receive_append_entries(self, msg):
+        # reset election timeout
+        self.reset_election_timeout()
+        
+        # if the append entries message is from an old term, respond with failure
+        if msg["term"] < self.current_term:
+            append_entries_response_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": msg["leader"],
+                "type": RPC.APPEND_ENTRIES_RESPONSE,
+                "term": self.current_term,
+                "success": False,
+                "match_index": 0,
+            }
+            self.send(append_entries_response_msg)
+            return
+        
+        # if the index of the previous log entry does not match, respond with failure
+        if len(self.logs) <= msg["prev_log_index"] or self.logs[msg["prev_log_index"]]["term"] != msg["prev_log_term"]:
+            append_entries_response_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": msg["leader"],
+                "type": RPC.APPEND_ENTRIES_RESPONSE,
+                "term": self.current_term,
+                "success": False,
+                "match_index": 0,
+            }
+            self.send(append_entries_response_msg)
+            return
+    
+        # delete conflicting entries
+        for i in range(msg["prev_log_index"] + 1, len(self.logs)):
+            if i >= len(msg["entries"]) + msg["prev_log_index"] or self.logs[i]["term"] != msg["entries"][i - msg["prev_log_index"]]["term"]:
+                self.logs = self.logs[:i]
+                break
+            
+        #  Append any new entries not already in the log
+        for i in range(len(self.logs) - msg["prev_log_index"] - 1, len(msg["entries"])):
+            self.logs.append(msg["entries"][i])
+        
+        # update commit index
+        self.commit_index = min(msg["leader_commit"], len(self.logs) - 1)
+        
+        # commit entries up to the commit index
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            self.kvstore[self.logs[self.last_applied]["key"]] = self.logs[self.last_applied]["value"]
+            
+        # if the message is a heartbeat, don't send a response
+        if len(msg["entries"]) == 0:
+            return  
+            
+        # respond with success
+        append_entries_response_msg = {
+            "src": self.id,
+            "dst": msg["src"],
+            "leader": msg["leader"],
+            "type": RPC.APPEND_ENTRIES_RESPONSE,
+            "term": self.current_term,
+            "success": True,
+            "match_index": len(self.logs) - 1,
+        }
+        
+        self.send(append_entries_response_msg)
+        
+    # receive response to AppendEntries RPC
+    def receive_append_entries_response(self, msg):
+        # if follower log updated, update next and match index
+        if msg["success"]:
+            self.match_index[msg["src"]] = msg["match_index"]
+            self.next_index[msg["src"]] = self.match_index[msg["src"]] + 1
+        else:
+            # otherwise, decrement next index and retry
+            self.next_index[msg["src"]] -= 1
+            self.request_append_entries(msg["src"])
+        
+        # find N such that a quorum of followers have logs at least N and update commit index to N
+        for i in range(len(self.logs) - 1, self.commit_index, -1):
+            count = 1
+            for follower in self.others:
+                if self.match_index[follower] >= i:
+                    count += 1
+            if count >= math.ceil((len(self.others) + 1) / 2):
+                self.commit_index = i
+                break
+        
+        # commit entries up to the commit index
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            self.kvstore[self.logs[self.last_applied]["key"]] = self.logs[self.last_applied]["value"]
+            # send ok message to client indicating that the operation was successful
+            ok_msg = {
+                "src": self.id,
+                "dst": self.logs[self.last_applied]["src"],
+                "leader": self.current_leader,
+                "type": "ok",
+                "MID": self.logs[self.last_applied]["MID"],
+            }
+            self.send(ok_msg)
+        
+
+    # HANDLING MESSAGES
+    
+    # handle put request from client
+    def handle_client_put(self, msg):
+        # if user is leader, append message to log and send append entries to followers
+        if self.current_role == Role.LEADER:
+            self.logs.append({
+                "term": self.current_term,
+                "key": msg["key"],
+                "value": msg["value"],
+                "MID": msg["MID"],
+                "src": msg["src"],
+            })
+            for follower in self.others:
+                if len(self.logs) - 1 >= self.next_index[follower]:
+                    self.request_append_entries(follower)
+        # if user is not leader, redirect to leader
+        elif self.current_leader:
+            redirect_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": self.current_leader,
+                "type": "redirect",
+                "MID": msg["MID"],
+            }
+            self.send(redirect_msg)
+        # if user is not leader and no leader is known, send fail message
+        else:
+            fail_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": BROADCAST,
+                "type": "fail",
+                "MID": msg["MID"],
+            }
+            self.send(fail_msg)
+    
+    # handle get request from client
+    def handle_client_get(self, msg):
+        # if key is in kvstore, send ok message with value to client
+        if msg["key"] in self.kvstore:
+            ok_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": self.current_leader,
+                "type": "ok",
+                "MID": msg["MID"],
+                "value": self.kvstore[msg["key"]]
+            }
+            self.send(ok_msg)
+        # if key is not in kvstore, redirect to leader
+        elif self.current_leader:
+            redirect_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": self.current_leader,
+                "type": "redirect",
+                "MID": msg["MID"],
+            }
+            self.send(redirect_msg)
+        # if user is not leader and no leader is known, send fail message
+        else:
+            fail_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": BROADCAST,
+                "type": "fail",
+                "MID": msg["MID"],
+            }
+            self.send(fail_msg)
+            
+    # check if message is an RPC message
+    def is_rpc(self, msg):
+        msg_types = [type for type in RPC]
+        return msg["type"] in msg_types
+
+    # handle messages for follower
+    def as_follower(self):        
+        unhandled = []
+        while self.messages:
+            msg = self.messages.pop(0)
+            
+            if self.is_rpc(msg) and msg["term"] > self.current_term:
+                self.current_term = msg["term"]
+                self.voted_for = None
+                self.current_leader = msg["src"]
+                self.reset_election_timeout()
+            
+            if msg["type"] == RPC.REQUEST_VOTE:
+                self.receive_request_vote(msg)
+            elif msg["type"] == RPC.APPEND_ENTRIES:
+                self.receive_append_entries(msg)
+            # if client message, redirect to leader
+            elif msg["type"] == "put" or msg["type"] == "get" and self.current_leader:
+                redirect_msg = {
+                    "src": self.id,
+                    "dst": msg["src"],
+                    "leader": self.current_leader,
+                    "type": "redirect",
+                    "MID": msg["MID"],
+                }
+                self.send(redirect_msg)
+            else:
+                unhandled.append(msg)
+        self.messages.extend(unhandled)
+
+    # handle messages for candidate
+    def as_candidate(self):
+        unhandled = []
+        while self.messages:
+            msg = self.messages.pop(0)
+            
+            # if RPC message with higher term, convert to follower
+            if self.is_rpc(msg) and msg["term"] > self.current_term:
+                self.convert_to_follower(msg)
+                self.messages.insert(0, msg)
+                break
+            
+            if msg["type"] == RPC.REQUEST_VOTE:
+                self.receive_request_vote(msg)
+            elif msg["type"] == RPC.REQUEST_VOTE_RESPONSE:
+                self.receive_vote(msg)
+            # if AppendEntries message received, convert to follower and handle message
+            elif msg["type"] == RPC.APPEND_ENTRIES:
+                self.convert_to_follower(msg)
+                self.receive_append_entries(msg)
+                break
+            else:
+                unhandled.append(msg)
+        self.messages.extend(unhandled)
+    
+    # handle messages for leader
+    def as_leader(self):
+        unhandled = []
+        while self.messages:
+            msg = self.messages.pop(0)
+            
+            # if RPC message with higher term, convert to follower
+            if self.is_rpc(msg) and msg["term"] > self.current_term:
+                self.convert_to_follower(msg)
+                self.messages.insert(0, msg)
+                break
+            
+            elif msg["type"] == RPC.APPEND_ENTRIES_RESPONSE:
+                self.receive_append_entries_response(msg)
+            elif msg["type"] == "put":
+                self.handle_client_put(msg)
+            elif msg["type"] == "get":
+                self.handle_client_get(msg)
+            else:
+                unhandled.append(msg)
+        self.messages.extend(unhandled)
+          
+    # receive all messages in loop using select  
+    def receive_all(self):
+        while True: 
+            ready = select.select([self.socket], [], [], 0.0000001)[0]
+            if self.socket not in ready:
+                break
+            data, addr = self.socket.recvfrom(65535)
+            if data:
+                msg = json.loads(data.decode('utf-8'))
+                self.messages.append(msg)     
+        
+    # main loop for the replica
+    def run(self):
+        while True:
+            self.receive_all()
+            
+            # if heartbeat timeout has passed, send heartbeat to followers
+            if self.check_heartbeat_timeout():
+                for follower in self.others:
+                    self.request_append_entries(follower, heartbeat=True)
+                self.reset_heartbeat_timeout()
+                
+            # if election timeout has passed, start an election
+            if self.check_election_timeout():
+                self.start_election()
+            
+            # handle messages based on role
+            if self.current_role == Role.FOLLOWER:
+                self.as_follower()
+            elif self.current_role == Role.CANDIDATE:
+                self.as_candidate()
+            elif self.current_role == Role.LEADER:
+                self.as_leader()
+            
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
